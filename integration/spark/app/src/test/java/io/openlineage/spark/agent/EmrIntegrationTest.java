@@ -148,4 +148,34 @@ class EmrIntegrationTest {
     assertThat("s3://" + emrTestParameters.getBucketName())
         .isEqualTo(completeEvent.getOutputs().get(0).getNamespace());
   }
+
+  @Test
+  void testImplicitGlueCatalogIsUsed() {
+    List<OpenLineage.RunEvent> runEvents =
+        emrTestEnvironment.runScript(
+            "glue_symlink_implicit_account_id.py",
+            Map.of(
+                "bucketName",
+                emrTestParameters.getBucketName(),
+                "outputPrefix",
+                emrTestParameters.getKeyPrefix() + "output",
+                "databaseName",
+                "peopleDatabase",
+                "sourceTableName",
+                "peopleSource",
+                "destinationTableName",
+                "peopleDestination"));
+
+    assertThat(runEvents).isNotEmpty();
+
+    OpenLineage.RunEvent completeEvent =
+        runEvents.stream()
+            .filter(runEvent -> !runEvent.getOutputs().isEmpty())
+            .filter(runEvent -> !runEvent.getInputs().isEmpty())
+            .filter(runEvent -> runEvent.getEventType() == OpenLineage.RunEvent.EventType.COMPLETE)
+            .findFirst()
+            .get();
+
+    List<OpenLineage.SymlinksDatasetFacetIdentifiers> identifiers = completeEvent.getOutputs().get(0).getFacets().getSymlinks().getIdentifiers();
+  }
 }
