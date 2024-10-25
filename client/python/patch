@@ -1,0 +1,353 @@
+diff --git a/.pre_commit/check-redactions.py b/.pre_commit/check-redactions.py
+index 7af3e206..130e7126 100755
+--- a/.pre_commit/check-redactions.py
++++ b/.pre_commit/check-redactions.py
+@@ -35,6 +35,7 @@ if __name__ == "__main__":
+         redact_module = next((m for m in REDACT_FIELDS if m["module"] == module_name), None)
+         if not redact_module:
+             not_found.extend([MissingClass(module_name, clazz) for clazz in classes])
++            continue
+         for clazz in classes:
+             # check if class is defined in yaml
+             if not next((c for c in redact_module["classes"] if c["class_name"] == clazz), None):
+diff --git a/client/python/openlineage/client/client.py b/client/python/openlineage/client/client.py
+index e996f673..3fb4658a 100644
+--- a/client/python/openlineage/client/client.py
++++ b/client/python/openlineage/client/client.py
+@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, Union, cast
+
+ import attr
+ import yaml
+-from openlineage.client.filter import Filter, create_filter
++from openlineage.client.filter import Filter, FilterConfig, create_filter
+ from openlineage.client.serde import Serde
+
+ if TYPE_CHECKING:
+@@ -20,8 +20,13 @@ if TYPE_CHECKING:
+ import contextlib
+
+ from openlineage.client import event_v2
++from openlineage.client.facets import FacetsConfig
+ from openlineage.client.run import DatasetEvent, JobEvent, RunEvent
+-from openlineage.client.transport import Transport, TransportFactory, get_default_factory
++from openlineage.client.transport import (
++    Transport,
++    TransportFactory,
++    get_default_factory,
++)
+ from openlineage.client.transport.http import HttpConfig, HttpTransport, create_token_provider
+ from openlineage.client.transport.noop import NoopConfig, NoopTransport
+
+@@ -38,6 +43,24 @@ class OpenLineageClientOptions:
+     adapter: HTTPAdapter = attr.ib(default=None)
+
+
++@attr.s
++class OpenLineageConfig:
++    transport: dict[str, Any] | None = attr.ib(factory=dict)
++    facets: FacetsConfig = attr.ib(factory=FacetsConfig)
++    filters: list[FilterConfig] = attr.ib(factory=list)
++
++    @classmethod
++    def from_dict(cls, params: dict[str, Any]) -> OpenLineageConfig:
++        config = cls()
++        if "transport" in params:
++            config.transport = params["transport"]
++        if "facets" in params:
++            config.facets = FacetsConfig(**params["facets"])
++        if "filters" in params:
++            config.filters = [FilterConfig(**filter_config) for filter_config in params["filters"]]
++        return config
++
++
+ log = logging.getLogger(__name__)
+ _T = TypeVar("_T", bound="OpenLineageClient")
+
+@@ -68,7 +91,7 @@ class OpenLineageClient:
+
+         # Make config ellipsis - as a guard value to not try to
+         # reload yaml each time config is referred to.
+-        self._config: dict[str, dict[str, str]] | None = None
++        self._config: OpenLineageConfig | None = None
+
+         self._alias_env_vars()
+
+@@ -78,7 +101,7 @@ class OpenLineageClient:
+         log.info("OpenLineageClient will use `%s` transport", self.transport.kind)
+
+         self._filters: list[Filter] = []
+-        for conf in self.config.get("filters", []):
++        for conf in self.config.filters:
+             _filter = create_filter(conf)
+             if _filter:
+                 self._filters.append(_filter)
+@@ -122,6 +145,8 @@ class OpenLineageClient:
+             log.debug("OpenLineage event has been filtered out and will not be emitted.")
+             return
+
++        event = self.add_environment_facets(event)
++
+         if log.isEnabledFor(logging.DEBUG):
+             val = Serde.to_json(event).encode("utf-8")
+             log.debug("OpenLineageClient will emit event %s", val)
+@@ -129,17 +154,23 @@ class OpenLineageClient:
+         log.debug("OpenLineage event successfully emitted.")
+
+     @property
+-    def config(self) -> dict[str, Any]:
++    def config(self) -> OpenLineageConfig:
+         """Content of OpenLineage YAML config file."""
+         if self._config is None:
+-            config_path = self._find_yaml_config_path()
+-            if config_path:
+-                self._config = self._get_config_file_content(config_path)
+-            else:
+-                self._config = {}
++            config_dict: dict[str, Any] | None
++            if config_path := self._find_yaml_config_path():
++                config_dict = self._get_config_file_content(config_path)
++            elif not (config_dict := self._load_config_from_env_variables()):
++                config_dict = {}
++            try:
++                self._config = OpenLineageConfig.from_dict(config_dict)
++            except Exception as e:
++                # raise exception that structure of the config does not match
++                msg = "Failed to parse OpenLineage config."
++                raise ValueError(msg) from e
+         return self._config
+
+-    def _resolve_transport(self, **kwargs: Any) -> Transport:  # noqa: PLR0911
++    def _resolve_transport(self, **kwargs: Any) -> Transport:
+         """
+         Resolves the transport mechanism based on the provided arguments or environment settings.
+
+@@ -164,9 +195,9 @@ class OpenLineageClient:
+             return cast(Transport, kwargs["transport"])
+
+         # 3. Check if transport configuration is provided in YAML config file
+-        if self.config.get("transport"):
++        if self.config.transport:
+             factory = kwargs.get("factory") or get_default_factory()
+-            return factory.create(self.config["transport"])
++            return factory.create(self.config.transport)
+
+         # 4. Check legacy HTTP transport initialization with url and options
+         if kwargs.get("url"):
+@@ -174,16 +205,11 @@ class OpenLineageClient:
+                 url=kwargs["url"], options=kwargs.get("options"), session=kwargs.get("session")
+             )
+
+-        # 5. Check transport initialization with env variables
+-        if config := self._load_config_from_env_variables():
+-            factory = kwargs.get("factory") or get_default_factory()
+-            return factory.create(config["transport"])
+-
+-        # 6. Check HTTP transport initialization with env variables
++        # 5. Check HTTP transport initialization with env variables
+         if os.environ.get("OPENLINEAGE_URL"):
+             return self._http_transport_from_env_variables()
+
+-        # 7. If all else fails, print events to console
++        # 6. If all else fails, print events to console
+         from openlineage.client.transport.console import ConsoleConfig, ConsoleTransport
+
+         log.warning("Couldn't find any OpenLineage transport configuration; will print events to console.")
+@@ -274,18 +300,18 @@ class OpenLineageClient:
+             os.environ[f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__TYPE"] = "http"
+             os.environ[f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__URL"] = url
+             if api_key := os.environ.get("OPENLINEAGE_API_KEY"):
+-                os.environ[
+-                    f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__AUTH"
+-                ] = json.dumps(
+-                    {
+-                        "type": "api_key",
+-                        "apiKey": api_key,
+-                    }
++                os.environ[f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__AUTH"] = (
++                    json.dumps(
++                        {
++                            "type": "api_key",
++                            "apiKey": api_key,
++                        }
++                    )
+                 )
+             if endpoint := os.environ.get("OPENLINEAGE_ENDPOINT"):
+-                os.environ[
+-                    f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__ENDPOINT"
+-                ] = endpoint
++                os.environ[f"OPENLINEAGE__TRANSPORT__TRANSPORTS__{default_transport_name}__ENDPOINT"] = (
++                    endpoint
++                )
+
+     @classmethod
+     def _load_config_from_env_variables(cls) -> dict[str, Any] | None:
+@@ -323,3 +349,24 @@ class OpenLineageClient:
+
+         # Overwrite if key already exists
+         current[keys[-1]] = value
++
++    def add_environment_facets(self, event: Event) -> Event:
++        """
++        Adds environment variables as facets to the event object.
++        """
++        if isinstance(event, RunEvent) and (env_vars := self._collect_environment_variables()):
++            event.run.facets["environmentVariables"] = env_vars
++        return event
++
++    def _collect_environment_variables(self) -> dict[str, str]:
++        """
++        Collects and returns a dictionary of relevant environment variables.
++        """
++        filtered_vars = {k: v for k, v in os.environ.items() if k in self.config.facets.environment_variables}
++        missing_vars = set(self.config.facets.environment_variables) - set(filtered_vars)
++        if missing_vars:
++            log.warning(
++                "The following environment variables are missing: %s when adding to OpenLineage event",
++                missing_vars,
++            )
++        return filtered_vars
+diff --git a/client/python/openlineage/client/facet_v2.py b/client/python/openlineage/client/facet_v2.py
+index 3bf3f418..177ddae1 100644
+--- a/client/python/openlineage/client/facet_v2.py
++++ b/client/python/openlineage/client/facet_v2.py
+@@ -9,6 +9,7 @@ from openlineage.client.generated import (
+     datasource_dataset,
+     documentation_dataset,
+     documentation_job,
++    environment_variables_run,
+     error_message_run,
+     external_query_run,
+     extraction_error_run,
+@@ -54,6 +55,7 @@ __all__ = [
+     "datasource_dataset",
+     "documentation_dataset",
+     "documentation_job",
++    "environment_variables_run",
+     "error_message_run",
+     "external_query_run",
+     "extraction_error_run",
+diff --git a/client/python/openlineage/client/filter.py b/client/python/openlineage/client/filter.py
+index 88d77d63..e6fe0194 100644
+--- a/client/python/openlineage/client/filter.py
++++ b/client/python/openlineage/client/filter.py
+@@ -5,12 +5,20 @@ from __future__ import annotations
+ import re
+ import typing
+
++import attr
+ from openlineage.client.event_v2 import RunEvent as RunEvent_v2
+ from openlineage.client.run import RunEvent
+
+ RunEventType = typing.Union[RunEvent, RunEvent_v2]
+
+
++@attr.s
++class FilterConfig:
++    type: str | None = attr.ib(default=None)
++    match: str | None = attr.ib(default=None)
++    regex: str | None = attr.ib(default=None)
++
++
+ class Filter:
+     def filter_event(self, event: RunEventType) -> RunEventType | None:
+         ...
+@@ -36,12 +44,12 @@ class RegexFilter(Filter):
+         return event
+
+
+-def create_filter(conf: dict[str, str]) -> Filter | None:
+-    if "type" not in conf:
++def create_filter(conf: FilterConfig) -> Filter | None:
++    if not conf.type:
+         return None
+     # Switch in 3.10 🙂
+-    if conf["type"] == "exact":
+-        return ExactMatchFilter(match=conf["match"])
+-    if conf["type"] == "regex":
+-        return RegexFilter(regex=conf["regex"])
++    if conf.type == "exact" and conf.match:
++        return ExactMatchFilter(match=conf.match)
++    if conf.type == "regex" and conf.regex:
++        return RegexFilter(regex=conf.regex)
+     return None
+diff --git a/client/python/openlineage/client/transport/transport.py b/client/python/openlineage/client/transport/transport.py
+index be6b4555..facb3963 100644
+--- a/client/python/openlineage/client/transport/transport.py
++++ b/client/python/openlineage/client/transport/transport.py
+@@ -20,6 +20,8 @@ from __future__ import annotations
+
+ from typing import TYPE_CHECKING, Any, TypeVar
+
++import attr
++
+ if TYPE_CHECKING:
+     from openlineage.client.client import Event
+
+@@ -27,6 +29,7 @@ if TYPE_CHECKING:
+ _T = TypeVar("_T", bound="Config")
+
+
++@attr.s
+ class Config:
+     @classmethod
+     def from_dict(cls: type[_T], params: dict[str, Any]) -> _T:  # noqa: ARG003
+diff --git a/client/python/redact_fields.yml b/client/python/redact_fields.yml
+index dce0b306..b8248e38 100644
+--- a/client/python/redact_fields.yml
++++ b/client/python/redact_fields.yml
+@@ -92,6 +92,10 @@
+   classes:
+     - class_name: DocumentationJobFacet
+       redact_fields: []
++- module: environment_variables_run
++  classes:
++    - class_name: EnvironmentVariablesRunFacet
++      redact_fields: []
+ - module: error_message_run
+   classes:
+     - class_name: ErrorMessageRunFacet
+diff --git a/client/python/tests/test_client.py b/client/python/tests/test_client.py
+index 5d89bf6f..ce9d76a8 100644
+--- a/client/python/tests/test_client.py
++++ b/client/python/tests/test_client.py
+@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
+ from unittest.mock import MagicMock, patch
+
+ import pytest
+-from openlineage.client.client import OpenLineageClient, OpenLineageClientOptions
++from openlineage.client.client import OpenLineageClient, OpenLineageClientOptions, OpenLineageConfig
+ from openlineage.client.run import (
+     SCHEMA_URL,
+     Dataset,
+@@ -353,20 +353,22 @@ def test_find_yaml_config_path_checks_all_paths(mock_is_file, mocker: MockerFixt
+
+ @patch("yaml.safe_load", return_value=None)
+ def test_config_file_content_empty_file(mock_yaml) -> None:  # noqa: ARG001
+-    assert OpenLineageClient().config == {}
++    assert OpenLineageClient().config == OpenLineageConfig()
+
+
+ def test_config(mocker: MockerFixture, root: Path) -> None:
+     mocker.patch.dict(os.environ, {"OPENLINEAGE_CONFIG": str(root / "config" / "http.yml")})
+-    assert OpenLineageClient().config == {
+-        "transport": {
+-            "auth": {"apiKey": "random_token", "type": "api_key"},
+-            "compression": "gzip",
+-            "endpoint": "api/v1/lineage",
+-            "type": "http",
+-            "url": "http://localhost:5050",
++    assert OpenLineageClient().config == OpenLineageConfig.from_dict(
++        {
++            "transport": {
++                "auth": {"apiKey": "random_token", "type": "api_key"},
++                "compression": "gzip",
++                "endpoint": "api/v1/lineage",
++                "type": "http",
++                "url": "http://localhost:5050",
++            }
+         }
+-    }
++    )
+
+
+ @patch.dict(
